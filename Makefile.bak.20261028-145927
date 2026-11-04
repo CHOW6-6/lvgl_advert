@@ -1,0 +1,172 @@
+#
+# Makefile
+#
+# 目标平台：GEC6818（S5P6818 / ARMv7 / Linux 3.4.39 / 800x480 32bpp fbdev + gslX680 触摸）
+#
+# 用法：
+#   make                      交叉编译出开发板可执行文件 build/bin/demo（缺省行为）
+#   make SIM=1                PC 模拟器（X11 窗口），用于先在电脑上调界面
+#   make clean
+#   make deploy               推送到开发板 $(BOARD):$(BOARD_DIR)
+#   make run                  推送并在开发板前台运行
+#
+# 可覆盖的变量：
+#   CROSS_COMPILE  交叉工具链前缀，缺省 arm-linux-（即板上 BSP 自带的 arm-linux-gcc 5.4.0）
+#   TOOLCHAIN_BIN  工具链不在 PATH 时的绝对路径，缺省 $(HOME)/toolchains/arm-5.4.0/5.4.0/usr/bin
+#   STATIC         1 = 静态链接（配合 musl 工具链），缺省 0 = 动态链接（配合 BSP 工具链）
+#   OPT            优化选项，缺省 -O2
+#   BOARD          板子 SSH 地址，缺省 root@172.20.120.220
+#   BOARD_DIR      板上安装目录，缺省 /root/lvgl-demo
+#
+# 关于工具链（重要）：
+#   目标板 rootfs 是 Buildroot 2016.11 + glibc 2.23 + armel（软浮点，解释器 /lib/ld-linux.so.3）。
+#   * 缺省用板子 BSP 的 arm-linux-gcc 5.4.0（arm-none-linux-gnueabi，--with-float=soft），
+#     它自带同版本 glibc 2.23 sysroot，动态链接即可，产物 600KB 左右；
+#     实测产物只引用到 GLIBC_2.4 符号，板上一定能加载。
+#   * 千万不要用 Ubuntu 仓库的 arm-linux-gnueabi-gcc（glibc 2.39+），板上会报
+#     "GLIBC_2.34 not found" —— 这就是必须自带 sysroot 的原因。
+#   * 没有 BSP 工具链时可用备选：musl 静态链接，零运行时依赖
+#       make CROSS_COMPILE=arm-linux-musleabi- STATIC=1 \
+#            TOOLCHAIN_BIN=$(HOME)/toolchains/arm-linux-musleabi-cross/bin
+#
+
+# ---------------------------------------------------------------------------
+# 1. 平台选择
+# ---------------------------------------------------------------------------
+SIM ?= 0
+
+ifeq ($(SIM),1)
+  PLATFORM         := sim
+  CROSS_COMPILE    ?=
+  LV_DRIVER_USE    := USE_X11
+  PLATFORM_CFLAGS  :=
+  PLATFORM_LDFLAGS :=
+  PLATFORM_LDLIBS  := -lX11 -lpthread -lm
+  PLATFORM_DEFINES := -D SIMULATOR=1 -D USE_FBDEV=0
+  SRC_ROOT         := main ui test lvgl/src lvgl/demos lvgl/examples lv_drivers
+else
+  PLATFORM         := board
+  CROSS_COMPILE    ?= arm-linux-
+  STATIC           ?= 0
+  LV_DRIVER_USE    := USE_FBDEV
+  PLATFORM_CFLAGS  := -march=armv7-a -mtune=cortex-a53
+  PLATFORM_LDLIBS  := -lpthread -lm
+  PLATFORM_DEFINES := -D SIMULATOR=0 -D USE_X11=0 -D USE_SDL=0
+  SRC_ROOT         := main ui test lvgl/src lvgl/demos lv_drivers
+
+  # STATIC=1：全静态（musl 工具链用；-no-pie 是因为 musl 缺省会产出 static-pie）
+  ifeq ($(STATIC),1)
+    PLATFORM_LDFLAGS := -static -no-pie -Wl,--gc-sections
+  else
+    PLATFORM_LDFLAGS := -Wl,--gc-sections
+  endif
+endif
+
+CC    := $(CROSS_COMPILE)gcc
+STRIP := $(CROSS_COMPILE)strip
+
+# 工具链自检：$(CROSS_COMPILE)gcc 不在 PATH 里时，回退到本机解压好的工具链目录，
+# 这样直接敲 make（不 source 脚本、不 export PATH）也能编过。
+ifeq ($(PLATFORM),board)
+  ifeq ($(STATIC),1)
+    TOOLCHAIN_BIN ?= $(HOME)/toolchains/arm-linux-musleabi-cross/bin
+  else
+    TOOLCHAIN_BIN ?= $(HOME)/toolchains/arm-5.4.0/5.4.0/usr/bin
+  endif
+  ifeq ($(shell command -v $(CROSS_COMPILE)gcc 2>/dev/null),)
+    CC    := $(TOOLCHAIN_BIN)/$(CROSS_COMPILE)gcc
+    STRIP := $(TOOLCHAIN_BIN)/$(CROSS_COMPILE)strip
+    $(info [提示] PATH 里没有 $(CROSS_COMPILE)gcc，改用 $(TOOLCHAIN_BIN))
+  endif
+endif
+
+PROJECT := lvgl-demo
+SRC_EXT := c
+OBJ_EXT := o
+
+WORKING_DIR := ./build
+BUILD_DIR   := $(WORKING_DIR)/obj
+BIN_DIR     := $(WORKING_DIR)/bin
+BIN         := $(BIN_DIR)/demo
+
+MAKEFLAGS += -j $(shell nproc)
+
+# ---------------------------------------------------------------------------
+# 2. 编译/链接选项
+# ---------------------------------------------------------------------------
+OPT ?= -O2
+
+# 注意：这里去掉了原来的 -Wstack-usage=2048，LVGL 在 -O2 下会刷上千条 "stack usage" 提示
+WARNINGS := -Wall -Wextra \
+            -Wshadow -Wundef -Wmaybe-uninitialized -Wmissing-prototypes \
+            -Wno-discarded-qualifiers -Wno-unused-function -Wno-error=strict-prototypes \
+            -Wpointer-arith -fno-strict-aliasing -Wno-error=cpp -Wuninitialized \
+            -Wno-unused-parameter -Wno-missing-field-initializers -Wno-format-nonliteral \
+            -Wno-cast-qual -Wunreachable-code -Wno-switch-default \
+            -Wreturn-type -Wmultichar -Wformat-security -Wno-ignored-qualifiers \
+            -Wno-error=pedantic -Wno-sign-compare -Wno-error=missing-prototypes \
+            -Wdouble-promotion -Wclobbered -Wdeprecated \
+            -Wempty-body -Wtype-limits -Wsizeof-pointer-memaccess
+
+CFLAGS := $(OPT) $(WARNINGS) $(PLATFORM_CFLAGS) -ffunction-sections -fdata-sections
+# -MMD -MP：把头文件依赖写进 .d，改 lv_conf.h / lv_drv_conf.h 后能正确重编
+CFLAGS += -MMD -MP
+
+# 选中的低层显示驱动：USE_FBDEV（板子）或 USE_X11（模拟器）
+DEFINES := -D LV_BUILD_TEST=0 -D $(LV_DRIVER_USE) $(PLATFORM_DEFINES)
+
+# 先包含 ui/simulator/inc，便于用项目自带 lv_conf.h 覆盖根目录的 lv_conf.h
+# -I./test/：让 main.c 里的 #include "test.h" 能被找到（test/ 不在根目录下）
+INC := -I./ui/simulator/inc/ -I./ -I./lvgl/ -I./test/ -I./advert/
+
+LDLIBS  := $(PLATFORM_LDLIBS)
+LDFLAGS := $(PLATFORM_LDFLAGS)
+
+COMPILE = $(CC) $(CFLAGS) $(INC) $(DEFINES)
+
+# ---------------------------------------------------------------------------
+# 3. 源文件（显式指定根目录，避开 lvgl/tests 里自带的 main()）
+# ---------------------------------------------------------------------------
+SRCS    := $(shell find $(SRC_ROOT) -type f -name '*.c' 2>/dev/null)
+OBJECTS := $(addprefix $(BUILD_DIR)/,$(SRCS:.$(SRC_EXT)=.$(OBJ_EXT)))
+DEPS    := $(OBJECTS:.$(OBJ_EXT)=.d)
+
+all: $(BIN)
+
+$(BUILD_DIR)/%.$(OBJ_EXT): %.$(SRC_EXT) lv_demo_conf.h lv_conf.h lv_drv_conf.h Makefile
+	@echo '  CC  $<'
+	@mkdir -p $(dir $@)
+	@$(COMPILE) -c -o "$@" "$<"
+
+$(BIN): $(OBJECTS)
+	@mkdir -p $(BIN_DIR)
+	@echo '  LD  $@'
+	@$(CC) -o $(BIN) $(OBJECTS) $(LDFLAGS) $(LDLIBS)
+	@$(STRIP) --strip-unneeded $(BIN) 2>/dev/null || true
+	@echo "  完成: $(BIN)  ($$(stat -c%s $(BIN)) 字节, $(PLATFORM))"
+
+clean:
+	rm -rf $(WORKING_DIR)
+
+install: $(BIN)
+	install -d ${DESTDIR}/usr/lib/${PROJECT}/bin
+	install $< ${DESTDIR}/usr/lib/${PROJECT}/bin/
+
+# ---------------------------------------------------------------------------
+# 4. 部署到开发板（板上 dropbear 没有 sftp 子系统，scp 会失败，故走 ssh 管道）
+# ---------------------------------------------------------------------------
+BOARD     ?= root@172.20.120.220
+BOARD_DIR ?= /root/lvgl-demo
+
+deploy: $(BIN)
+	@echo "  部署 -> $(BOARD):$(BOARD_DIR)"
+	@ssh -o StrictHostKeyChecking=accept-new $(BOARD) "mkdir -p $(BOARD_DIR)"
+	@cat $(BIN) | ssh $(BOARD) "cat > $(BOARD_DIR)/demo.tmp && chmod 755 $(BOARD_DIR)/demo.tmp && mv $(BOARD_DIR)/demo.tmp $(BOARD_DIR)/demo"
+	@echo "  已部署。板上执行：$(BOARD_DIR)/demo"
+
+run: deploy
+	@ssh -t $(BOARD) "cd $(BOARD_DIR) && ./demo"
+
+.PHONY: all clean install deploy run
+
+-include $(DEPS)

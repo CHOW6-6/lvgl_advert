@@ -1,0 +1,24 @@
+# Ignore build folder
+build/
+
+# Ignore the top-level UI folder, this should be commited in its own repository
+# (anchored so that weather/ui/ source files stay tracked)
+/ui/
+
+# Ignore all dot folders, with below exceptions
+.*/
+
+# VSCode
+!.vscode/
+!.vscode/*
+
+# 主机抓取的心知天气缓存（make weather 每次重写，不入库）
+weather_cache.txt
+.weather_pushed
+
+# 本地设备/API 凭据配置，不入库
+weather/config/weather_conf.json
+
+# Python 构建产物，不入库
+__pycache__/
+*.pyc

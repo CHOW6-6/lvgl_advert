@@ -1,0 +1,42 @@
+#!/bin/sh
+#
+# GEC6818 天气监测中心开机自启
+#
+# 由 `make deploy-weather` 自动装到 /etc/init.d/S99weather（BusyBox init 按 S99 顺序执行）。
+# 板子没有 RTC，重启后系统时间会退回 2015 年；MQTT 的口令按小时算，时间错了云也连不上，
+# 所以部署时 `make deploy-weather` 会顺手用主机时间校准一次。这里只管把程序拉起来。
+#
+# 手动操作：/etc/init.d/S99weather {start|stop|restart}
+
+DIR=/root/lvgl-weather
+DAEMON=$DIR/weather
+
+start() {
+    echo -n "Starting weather: "
+    killall weather 2>/dev/null
+
+    # 背光默认偏暗，广告牌得亮一点（没有这个节点就跳过）
+    [ -w /sys/class/backlight/pwm-backlight/brightness ] && \
+        echo 200 > /sys/class/backlight/pwm-backlight/brightness
+
+    [ -x "$DAEMON" ] || { echo "FAILED (找不到 $DAEMON)"; return 1; }
+
+    cd "$DIR" || return 1
+    # 日志写 /tmp（rootfs 是只读镜像也有地方落），进程脱离终端
+    ./weather > /tmp/weather-run.log 2>&1 < /dev/null &
+    echo "ok"
+}
+
+stop() {
+    echo -n "Stopping weather: "
+    killall weather 2>/dev/null
+    echo "ok"
+}
+
+case "$1" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) stop; sleep 1; start ;;
+    *)       echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
+esac
+exit 0
